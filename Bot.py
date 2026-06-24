@@ -1,6 +1,6 @@
 """
 CRYPTO GAINER SCREENER — TELEGRAM BOT
-Simple version compatible with Python 3.13
+Compatible with Render.com free tier
 """
 
 import os
@@ -10,8 +10,8 @@ import requests
 import threading
 import schedule
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# python-telegram-bot v20
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 import asyncio
@@ -26,32 +26,45 @@ MIN_GAIN  = 10
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# ── KEEP ALIVE WEB SERVER ───────────────────────────────
+# Render requires a web server to keep the service alive
+
+class KeepAlive(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Crypto Screener Bot is running!")
+    def log_message(self, format, *args):
+        pass  # silence web server logs
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), KeepAlive)
+    log.info(f"Web server running on port {port}")
+    server.serve_forever()
+
 # ── SCORING ─────────────────────────────────────────────
 
 def score_coin(gain, vol, mcap):
-    # Gain score
     if gain >= 50:   gs = 100
     elif gain >= 30: gs = 85
     elif gain >= 20: gs = 70
     elif gain >= 10: gs = 50
     else:            gs = 20
 
-    # Mcap score
     if 1e8 <= mcap <= 5e9:   ms = 100
     elif 5e9 < mcap <= 50e9: ms = 75
     elif 1e7 <= mcap < 1e8:  ms = 80
     elif mcap > 50e9:        ms = 40
     else:                    ms = 20
 
-    # Volume/mcap ratio score
     ratio = vol / mcap if mcap > 0 else 0
-    if ratio >= 0.4:   vs = 100
-    elif ratio >= 0.2: vs = 85
-    elif ratio >= 0.1: vs = 65
-    elif ratio >= 0.05:vs = 45
-    else:              vs = 20
+    if ratio >= 0.4:    vs = 100
+    elif ratio >= 0.2:  vs = 85
+    elif ratio >= 0.1:  vs = 65
+    elif ratio >= 0.05: vs = 45
+    else:               vs = 20
 
-    # Momentum score
     if 20 < gain < 80: mo = 100
     elif gain >= 80:   mo = 45
     elif gain >= 10:   mo = 70
@@ -102,11 +115,12 @@ def fetch_gainers():
             score = score_coin(gain, c.get("total_volume") or 0, c.get("market_cap") or 0)
             if score < MIN_SCORE:
                 continue
-            entry, tp1, tp2, stop, dip = calc_levels(c.get("current_price") or 0, score)
+            price = c.get("current_price") or 0
+            entry, tp1, tp2, stop, dip = calc_levels(price, score)
             results.append({
-                "name":   c.get("name",""),
-                "symbol": (c.get("symbol","")).upper(),
-                "price":  fmt_price(c.get("current_price") or 0),
+                "name":   c.get("name", ""),
+                "symbol": c.get("symbol", "").upper(),
+                "price":  fmt_price(price),
                 "gain":   round(gain, 2),
                 "mcap":   fmt_mcap(c.get("market_cap") or 0),
                 "score":  score,
@@ -128,9 +142,9 @@ def fetch_gainers():
 def build_message(coins):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     if coins is None:
-        return f"⚠️ Could not fetch data from CoinGecko. Try again later.\n🕐 {now}"
+        return f"⚠️ Could not fetch data. Try again.\n🕐 {now}"
     if not coins:
-        return f"😴 No strong signals right now.\nAll gainers scored below {MIN_SCORE}.\n🕐 {now}"
+        return f"😴 No strong signals right now.\n🕐 {now}"
 
     lines = [f"📊 *CRYPTO SCREENER*", f"🕐 {now}", f"✅ {len(coins)} signal(s)\n{'─'*26}"]
     for i, c in enumerate(coins[:8], 1):
@@ -177,7 +191,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_scan():
     if not CHAT_ID:
-        log.warning("TELEGRAM_CHAT_ID not set, skipping auto scan")
         return
     coins = fetch_gainers()
     msg = build_message(coins)
@@ -204,14 +217,20 @@ def main():
         return
 
     log.info("Starting bot...")
+
+    # Start web server in background (required for Render)
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+
+    # Start scheduler in background
+    sched_thread = threading.Thread(target=run_scheduler, daemon=True)
+    sched_thread.start()
+
+    # Start Telegram bot
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan",  cmd_scan))
     app.add_handler(CommandHandler("help",  cmd_help))
-
-    # Start scheduler in background
-    t = threading.Thread(target=run_scheduler, daemon=True)
-    t.start()
 
     log.info("Bot running!")
     app.run_polling()
