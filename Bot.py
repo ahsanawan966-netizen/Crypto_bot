@@ -733,9 +733,13 @@ async def auto_quick_scan():
     if not channel: return
     try:
         coins = run_quick_screener()
-        if coins:  # only send if there are signals
-            await channel.send("⚡ **Auto Quick Trade Scan**")
-            await send_messages(channel, build_quick_messages(coins))
+        # Only auto-send if there are HIGH QUALITY signals (score >= 65)
+        top_coins = [c for c in coins if c["score"] >= 65]
+        if top_coins:
+            await channel.send("⚡ **Auto Quick Trade Alert**")
+            await send_messages(channel, build_quick_messages(top_coins))
+        else:
+            log.info("Quick scan: no high quality signals, skipping auto-send")
     except Exception as e:
         log.error(f"Auto quick scan error: {e}")
 
@@ -759,16 +763,22 @@ def scheduler():
             future.result(timeout=300)
         except Exception as e:
             log.error(f"Scheduler error: {e}")
-    schedule.every(SCAN_HOURS).hours.do(job)
-    # Quick trade scan every 30 mins
+
     def quick_job():
-        asyncio.run_coroutine_threadsafe(auto_quick_scan(), bot.loop)
-    schedule.every(30).minutes.do(quick_job)
-    # Also run first scan 5 minutes after bot starts
-    schedule.every(5).minutes.do(lambda: (job(), schedule.cancel_job(schedule.jobs[-1])))
+        future = asyncio.run_coroutine_threadsafe(auto_quick_scan(), bot.loop)
+        try:
+            future.result(timeout=180)
+        except Exception as e:
+            log.error(f"Quick scan error: {e}")
+
+    # SMC scan every 4 hours
+    schedule.every(4).hours.do(job)
+    # Quick trade scan every 2 hours (offset by 2hrs)
+    schedule.every(2).hours.do(quick_job)
+
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(60)
 
 @bot.event
 async def on_ready():
