@@ -1,9 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: aka-crypto-bot
     runtime: python
     region: singapore
-    plan: starter
+    plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python3 Bot_v7.py"
     envVars:
