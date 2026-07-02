@@ -1,16 +1,47 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║     AKA SMART MONEY CRYPTO SCREENER BOT v6.0            ║
+║     AKA SMART MONEY CRYPTO SCREENER BOT v7.0             ║
 ║     Built for Ahsan | Aka Trading Signals                ║
-║     FINAL VERSION — Catches volume explosions LIVE       ║
 ╚══════════════════════════════════════════════════════════╝
 
-CORE LOGIC:
-- Scans every 5 minutes across ALL USDT futures pairs
-- Watches LIVE candle volume on 30m chart
-- Fires alert when current candle volume is 50x+ above average
-- No gain filter — catches coins BEFORE they move
-- This is exactly what would have caught TAC ($8K → $3.38M)
+WHAT CHANGED FROM v6.0 (and why):
+
+v6.0 fired on raw volume magnitude alone — a 30x+ spike on the 30m
+candle, with no idea whether that volume was buying or selling. That is
+the direct cause of "signal fires, coin dumps in front of me": a large
+share of what v6 called an "explosion" was actually a sell-off.
+
+v7.0 adds, in order of impact:
+
+  1. BUY/SELL DIRECTION FILTER (the core fix). Binance's kline data
+     includes taker-buy volume alongside total volume. We now require
+     60%+ of the exploding candle's volume to be aggressive BUYING
+     before it's even considered a candidate. This alone removes most
+     of the "dumps in front of me" signals.
+  2. MARKET STRUCTURE — swing high/low detection, trend classification
+     (bullish / bearish / ranging), Break of Structure and Change of
+     Character detection. A bearish structure now hard-blocks a long
+     signal instead of being ignored, like it was in v6.
+  3. HIGHER-TIMEFRAME BIAS — 1h EMA20 vs EMA50 trend check, used to
+     penalize or block signals that fight the bigger trend.
+  4. ORDER BLOCKS + FAIR VALUE GAPS — simplified SMC/ICT-style
+     detection, used as confluence in the score.
+  5. ATR-BASED STOPS/TARGETS — stop distance now scales with the
+     coin's real volatility instead of a flat 7%, so the R:R shown is
+     real math, not a fixed label.
+  6. HARDENED HTTP — a malformed or error API response from Binance
+     for one symbol can no longer throw an unhandled exception mid-scan.
+  7. auto_scan_loop now retries fetching the Discord channel on startup
+     instead of silently giving up forever if the first attempt fails.
+
+DELIBERATELY NOT INCLUDED YET:
+  - Volume profile / point-of-control — needs much higher-resolution
+    data than REST klines give cheaply. Real phase-2 project.
+  - ICT liquidity sweeps / kill-zone timing — phase 2.
+  - LIVE ORDER EXECUTION. This bot still only sends Discord alerts.
+    Wiring it to actually place trades on Binance is a separate,
+    bigger step that should only happen after this signal logic has
+    been backtested and has a known, real win rate.
 """
 
 import os, time, logging, requests, certifi
@@ -26,40 +57,46 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════
-# COOLDOWN — prevent same coin repeating
+# COOLDOWN
 # ══════════════════════════════════════════════════════════
 signal_cooldowns = {}
 
 def is_on_cooldown(symbol, hours=4):
     last = signal_cooldowns.get(symbol)
-    if not last: return False
+    if not last:
+        return False
     return datetime.utcnow() - last < timedelta(hours=hours)
 
 def mark_signaled(symbol):
     signal_cooldowns[symbol] = datetime.utcnow()
 
 # ══════════════════════════════════════════════════════════
-# SAFE HTTP
+# SAFE HTTP — guards against malformed / error JSON payloads
 # ══════════════════════════════════════════════════════════
-def safe_get(url, params=None, timeout=15):
+def safe_get_json(url, params=None, timeout=15):
     try:
         r = requests.get(url, params=params, timeout=timeout, verify=certifi.where())
         r.raise_for_status()
-        return r
+        data = r.json()
     except Exception as e:
         log.error(f"Request error {url}: {e}")
         return None
+    if not isinstance(data, list):
+        log.warning(f"Unexpected response shape from {url}: {str(data)[:200]}")
+        return None
+    return data
 
 # ══════════════════════════════════════════════════════════
 # DATA FETCHERS
 # ══════════════════════════════════════════════════════════
 def get_all_tickers():
-    """Get ALL USDT futures pairs — no filters"""
-    r = safe_get("https://fapi.binance.com/fapi/v1/ticker/24hr")
-    if not r: return {}
+    data = safe_get_json("https://fapi.binance.com/fapi/v1/ticker/24hr")
+    if not data:
+        return {}
     result = {}
-    for c in r.json():
-        if not c["symbol"].endswith("USDT"): continue
+    for c in data:
+        if not isinstance(c, dict) or not str(c.get("symbol", "")).endswith("USDT"):
+            continue
         try:
             result[c["symbol"]] = {
                 "symbol":   c["symbol"],
@@ -67,255 +104,341 @@ def get_all_tickers():
                 "price":    float(c.get("lastPrice", 0)),
                 "vol_usdt": float(c.get("quoteVolume", 0)),
             }
-        except: continue
+        except Exception:
+            continue
     return result
 
-def get_klines_30m(symbol, limit=40):
-    """Get 30m candles — this is the key timeframe for volume explosions"""
-    r = safe_get("https://fapi.binance.com/fapi/v1/klines",
-                 params={"symbol": symbol, "interval": "30m", "limit": limit})
-    if not r: return []
-    return [{
-        "open":      float(k[1]),
-        "high":      float(k[2]),
-        "low":       float(k[3]),
-        "close":     float(k[4]),
-        "vol_usdt":  float(k[7]),
-        "open_time": k[0],
-    } for k in r.json()]
-
-def get_klines_5m(symbol, limit=20):
-    """5m candles for very early detection"""
-    r = safe_get("https://fapi.binance.com/fapi/v1/klines",
-                 params={"symbol": symbol, "interval": "5m", "limit": limit})
-    if not r: return []
-    return [{
-        "open":     float(k[1]),
-        "high":     float(k[2]),
-        "low":      float(k[3]),
-        "close":    float(k[4]),
-        "vol_usdt": float(k[7]),
-    } for k in r.json()]
+def get_klines(symbol, interval, limit=45):
+    """Unified kline fetcher. Captures taker-buy volume (index 10) —
+    this is what powers the direction filter."""
+    data = safe_get_json("https://fapi.binance.com/fapi/v1/klines",
+                          params={"symbol": symbol, "interval": interval, "limit": limit})
+    if not data:
+        return []
+    out = []
+    for k in data:
+        try:
+            out.append({
+                "open":      float(k[1]),
+                "high":      float(k[2]),
+                "low":       float(k[3]),
+                "close":     float(k[4]),
+                "vol_usdt":  float(k[7]),   # total quote volume
+                "buy_vol":   float(k[10]),  # taker BUY quote volume
+                "open_time": k[0],
+            })
+        except (IndexError, ValueError, TypeError):
+            continue
+    return out
 
 def get_oi(symbol):
-    r = safe_get("https://fapi.binance.com/futures/data/openInterestHist",
-                 params={"symbol": symbol, "period": "30m", "limit": 4})
-    if not r: return None
-    data = r.json()
-    if len(data) < 2: return None
-    old = float(data[0]["sumOpenInterest"])
-    new = float(data[-1]["sumOpenInterest"])
-    return round((new - old) / old * 100, 2) if old > 0 else None
+    data = safe_get_json("https://fapi.binance.com/futures/data/openInterestHist",
+                          params={"symbol": symbol, "period": "30m", "limit": 4})
+    if not data or len(data) < 2:
+        return None
+    try:
+        old = float(data[0]["sumOpenInterest"])
+        new = float(data[-1]["sumOpenInterest"])
+        return round((new - old) / old * 100, 2) if old > 0 else None
+    except Exception:
+        return None
 
 def get_funding(symbol):
-    r = safe_get("https://fapi.binance.com/fapi/v1/fundingRate",
-                 params={"symbol": symbol, "limit": 1})
-    if not r: return None
-    data = r.json()
-    return round(float(data[-1]["fundingRate"]) * 100, 4) if data else None
+    data = safe_get_json("https://fapi.binance.com/fapi/v1/fundingRate",
+                          params={"symbol": symbol, "limit": 1})
+    if not data:
+        return None
+    try:
+        return round(float(data[-1]["fundingRate"]) * 100, 4)
+    except Exception:
+        return None
 
 # ══════════════════════════════════════════════════════════
-# CORE DETECTION ENGINE
+# VOLUME + DIRECTION  (the core fix)
 # ══════════════════════════════════════════════════════════
+def detect_volume_explosion(klines, min_ratio=30, min_vol=100_000, baseline_n=20):
+    if len(klines) < baseline_n + 2:
+        return False, 0, 0, 0
+    baseline = klines[-(baseline_n + 2):-2]
+    current = klines[-1]
+    vols = [k["vol_usdt"] for k in baseline if k["vol_usdt"] > 0]
+    if not vols:
+        return False, 0, 0, 0
+    avg_vol = sum(vols) / len(vols)
+    if avg_vol <= 0:
+        return False, 0, 0, 0
+    ratio = current["vol_usdt"] / avg_vol
+    is_explosion = ratio >= min_ratio and current["vol_usdt"] >= min_vol
+    return is_explosion, round(ratio, 1), round(avg_vol, 0), round(current["vol_usdt"], 0)
 
-def detect_volume_explosion_30m(klines_30m):
-    """
-    THE MAIN SIGNAL — detects TAC-style volume explosions.
-    
-    TAC pattern:
-    - Previous 20 candles avg volume: ~$50K
-    - Current candle: $3.38M = 67x explosion
-    - Alert fires DURING this candle, before price runs
-    
-    Returns: (is_explosion, ratio, avg_vol, current_vol)
-    """
-    if len(klines_30m) < 15: return False, 0, 0, 0
+def simple_ratio(klines, baseline_n=10):
+    if len(klines) < baseline_n + 2:
+        return 0
+    baseline = klines[-(baseline_n + 2):-2]
+    current = klines[-1]
+    vols = [k["vol_usdt"] for k in baseline if k["vol_usdt"] > 0]
+    if not vols:
+        return 0
+    avg = sum(vols) / len(vols)
+    if avg <= 0:
+        return 0
+    return round(current["vol_usdt"] / avg, 1)
 
-    # Use last 20 closed candles as baseline (exclude current)
-    baseline_candles = klines_30m[-22:-2]
-    current_candle   = klines_30m[-1]   # current live candle
-    prev_candle      = klines_30m[-2]   # last closed candle
+def buy_sell_ratio(candle):
+    """Fraction of this candle's volume that was aggressive BUYING.
+    > 0.5 = net buying pressure, < 0.5 = net selling pressure.
+    This is the field v6.0 never looked at."""
+    if candle["vol_usdt"] <= 0:
+        return 0.5
+    return round(candle["buy_vol"] / candle["vol_usdt"], 3)
 
-    vols = [k["vol_usdt"] for k in baseline_candles if k["vol_usdt"] > 0]
-    if not vols: return False, 0, 0, 0
+# ══════════════════════════════════════════════════════════
+# MARKET STRUCTURE — swings, trend, BOS / CHoCH
+# ══════════════════════════════════════════════════════════
+def find_swings(klines, left=2, right=2):
+    """Fractal swing highs/lows. Returns [(index, price, 'H'|'L'), ...]."""
+    swings = []
+    n = len(klines)
+    for i in range(left, n - right):
+        window_highs = [klines[j]["high"] for j in range(i - left, i + right + 1)]
+        window_lows  = [klines[j]["low"]  for j in range(i - left, i + right + 1)]
+        if klines[i]["high"] == max(window_highs) and window_highs.count(klines[i]["high"]) == 1:
+            swings.append((i, klines[i]["high"], "H"))
+        if klines[i]["low"] == min(window_lows) and window_lows.count(klines[i]["low"]) == 1:
+            swings.append((i, klines[i]["low"], "L"))
+    swings.sort(key=lambda s: s[0])
+    return swings
 
-    avg_vol     = sum(vols) / len(vols)
-    current_vol = current_candle["vol_usdt"]
-    prev_vol    = prev_candle["vol_usdt"]
+def market_structure(klines):
+    """Classify trend from the last two swings of each type and flag
+    BOS (continuation break) or CHoCH (character change) on the latest
+    close."""
+    swings = find_swings(klines)
+    if len(swings) < 4:
+        return {"trend": "ranging", "event": None, "last_high": None, "last_low": None}
 
-    if avg_vol <= 0: return False, 0, 0, 0
+    highs = [s for s in swings if s[2] == "H"]
+    lows  = [s for s in swings if s[2] == "L"]
+    if len(highs) < 2 or len(lows) < 2:
+        return {"trend": "ranging", "event": None, "last_high": None, "last_low": None}
 
-    ratio = current_vol / avg_vol
+    hh = highs[-1][1] > highs[-2][1]
+    hl = lows[-1][1]  > lows[-2][1]
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1]  < lows[-2][1]
 
-    # EXPLOSION: current candle is 30x+ above average
-    # (TAC was 379x — we use 30x to catch it earlier)
-    is_explosion = ratio >= 30 and current_vol >= 100_000  # min $100K to avoid dust
+    if hh and hl:
+        trend = "bullish"
+    elif lh and ll:
+        trend = "bearish"
+    else:
+        trend = "ranging"
 
-    return is_explosion, round(ratio, 1), round(avg_vol, 0), round(current_vol, 0)
+    last_close = klines[-1]["close"]
+    last_high  = highs[-1][1]
+    last_low   = lows[-1][1]
 
-def detect_volume_explosion_5m(klines_5m):
-    """
-    Ultra-early detection on 5m chart.
-    Catches the explosion even before 30m candle closes.
-    """
-    if len(klines_5m) < 10: return False, 0
+    event = None
+    if trend == "bullish" and last_close < last_low:
+        event = "CHoCH"
+    elif trend == "bearish" and last_close > last_high:
+        event = "CHoCH"
+    elif trend == "bullish" and last_close > last_high:
+        event = "BOS"
+    elif trend == "bearish" and last_close < last_low:
+        event = "BOS"
 
-    baseline = [k["vol_usdt"] for k in klines_5m[-12:-2] if k["vol_usdt"] > 0]
-    current  = klines_5m[-1]["vol_usdt"]
+    return {"trend": trend, "event": event, "last_high": last_high, "last_low": last_low}
 
-    if not baseline: return False, 0
-    avg = sum(baseline) / len(baseline)
-    if avg <= 0: return False, 0
+# ══════════════════════════════════════════════════════════
+# ORDER BLOCKS  (simplified SMC)
+# ══════════════════════════════════════════════════════════
+def find_last_bullish_ob(klines, lookback=15):
+    """Last down-close candle immediately before an impulsive break higher."""
+    n = len(klines)
+    start = max(n - lookback, 1)
+    for i in range(n - 2, start, -1):
+        c, nxt = klines[i], klines[i + 1]
+        if c["close"] < c["open"] and nxt["close"] > c["high"]:
+            return {"low": c["low"], "high": c["high"], "index": i}
+    return None
 
-    ratio = current / avg
-    is_explosion = ratio >= 20 and current >= 50_000
+# ══════════════════════════════════════════════════════════
+# FAIR VALUE GAPS
+# ══════════════════════════════════════════════════════════
+def find_recent_fvg(klines, lookback=10):
+    """3-candle imbalance. Returns the most recent gap found, if any."""
+    n = len(klines)
+    start = max(n - lookback, 1)
+    for i in range(n - 2, start, -1):
+        if i - 1 < 0 or i + 1 >= n:
+            continue
+        c1, c3 = klines[i - 1], klines[i + 1]
+        if c1["high"] < c3["low"]:
+            return {"type": "bullish", "top": c3["low"], "bottom": c1["high"]}
+        if c1["low"] > c3["high"]:
+            return {"type": "bearish", "top": c1["low"], "bottom": c3["high"]}
+    return None
 
-    return is_explosion, round(ratio, 1)
+# ══════════════════════════════════════════════════════════
+# HIGHER TIMEFRAME BIAS
+# ══════════════════════════════════════════════════════════
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
 
-def detect_price_action(klines_30m):
-    """
-    Check if price is just starting to move (not already pumped 50%+).
-    We want to catch the START, not the end.
-    """
-    if len(klines_30m) < 5: return True, 0
+def htf_bias(symbol):
+    """1h EMA20 vs EMA50 — simple higher-timeframe trend filter."""
+    k = get_klines(symbol, "1h", limit=60)
+    if len(k) < 55:
+        return "neutral"
+    closes = [c["close"] for c in k]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    if e20 is None or e50 is None:
+        return "neutral"
+    if e20 > e50 * 1.001:
+        return "bullish"
+    if e20 < e50 * 0.999:
+        return "bearish"
+    return "neutral"
 
-    # Price change in last 2 candles
-    start_price   = klines_30m[-3]["open"]
-    current_price = klines_30m[-1]["close"]
-    if start_price <= 0: return True, 0
-
-    recent_move = (current_price - start_price) / start_price * 100
-
-    # Allow entry if price hasn't moved more than 25% yet
-    # (still early enough for good entry)
-    is_early = recent_move <= 25
-    return is_early, round(recent_move, 2)
-
-def calc_rsi_simple(klines, period=14):
+# ══════════════════════════════════════════════════════════
+# RSI / ATR
+# ══════════════════════════════════════════════════════════
+def calc_rsi(klines, period=14):
     closes = [k["close"] for k in klines]
-    if len(closes) < period + 1: return None
-    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+    if len(closes) < period + 1:
+        return None
+    gains  = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period
-    return round(100 - (100 / (1 + ag/al)), 1) if al > 0 else 100.0
+    return round(100 - (100 / (1 + ag / al)), 1) if al > 0 else 100.0
+
+def calc_atr(klines, period=14):
+    if len(klines) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(klines)):
+        h, l, pc = klines[i]["high"], klines[i]["low"], klines[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+def detect_price_action(klines):
+    if len(klines) < 5:
+        return True, 0
+    start_price = klines[-3]["open"]
+    current_price = klines[-1]["close"]
+    if start_price <= 0:
+        return True, 0
+    recent_move = (current_price - start_price) / start_price * 100
+    return recent_move <= 25, round(recent_move, 2)
 
 # ══════════════════════════════════════════════════════════
-# SIGNAL SCORER
+# SCORER — confluence based
 # ══════════════════════════════════════════════════════════
-def score_explosion(vol_ratio_30m, vol_ratio_5m, recent_move,
-                    oi_chg, funding, ticker_vol, rsi):
+def score_signal(vol_ratio, buy_ratio, recent_move, struct, htf, ob, fvg,
+                  oi_chg, funding, ticker_vol, rsi):
     """
-    Score the explosion quality.
-    Higher ratio + early price move + OI surge = strongest signal.
+    Positive confluence factors and risk penalties are accumulated
+    separately and the positive side is capped BEFORE penalties are
+    applied. This matters: with a single running total capped only at
+    the end, a signal that already maxes out on volume/structure/OB/FVG
+    could have a bearish-HTF or overbought-RSI penalty largely absorbed
+    by the ceiling instead of actually pulling the score down. Applying
+    penalties after the cap guarantees they always bite at full weight,
+    exactly when it matters most (an otherwise "perfect-looking" signal
+    that's fighting the higher timeframe or already overbought).
     """
-    score = 0
+    positive = 0
+    penalty = 0
     reasons = []
 
-    # Volume explosion strength (most important factor)
-    if vol_ratio_30m >= 200:
-        score += 40
-        reasons.append(f"🚀 MEGA explosion {vol_ratio_30m}x on 30m (TAC-level)")
-    elif vol_ratio_30m >= 100:
-        score += 35
-        reasons.append(f"🔥 HUGE explosion {vol_ratio_30m}x on 30m")
-    elif vol_ratio_30m >= 50:
-        score += 28
-        reasons.append(f"💥 Major explosion {vol_ratio_30m}x on 30m")
-    elif vol_ratio_30m >= 30:
-        score += 20
-        reasons.append(f"⚡ Volume explosion {vol_ratio_30m}x on 30m")
+    if vol_ratio >= 100:
+        positive += 25; reasons.append(f"🔥 {vol_ratio}x volume explosion")
+    elif vol_ratio >= 50:
+        positive += 20; reasons.append(f"💥 {vol_ratio}x volume explosion")
+    else:
+        positive += 14; reasons.append(f"⚡ {vol_ratio}x volume explosion")
 
-    # 5m confirmation
-    if vol_ratio_5m >= 50:
-        score += 20
-        reasons.append(f"🔥 5m also exploding {vol_ratio_5m}x")
-    elif vol_ratio_5m >= 20:
-        score += 12
-        reasons.append(f"📈 5m surging {vol_ratio_5m}x")
-    elif vol_ratio_5m >= 10:
-        score += 6
-        reasons.append(f"📊 5m building {vol_ratio_5m}x")
+    positive += round((buy_ratio - 0.5) * 60)
+    reasons.append(f"🟢 {int(buy_ratio * 100)}% of that volume was buying")
 
-    # Price still early = better entry
+    if struct["trend"] == "bullish":
+        positive += 15; reasons.append("📈 Bullish market structure (higher highs/lows)")
+    if struct["event"] == "BOS":
+        positive += 12; reasons.append("✅ Break of structure — trend continuation")
+    elif struct["event"] == "CHoCH":
+        positive += 8; reasons.append("🔄 Change of character — fresh reversal forming")
+
+    if htf == "bullish":
+        positive += 12; reasons.append("📊 1h higher-timeframe trend agrees (bullish)")
+    elif htf == "bearish":
+        penalty += 15; reasons.append("⚠️ 1h higher-timeframe trend disagrees (bearish)")
+
+    if ob:
+        positive += 8; reasons.append("🧱 Bullish order block below price")
+    if fvg and fvg["type"] == "bullish":
+        positive += 6; reasons.append("📐 Unfilled bullish fair value gap nearby")
+
     if recent_move <= 5:
-        score += 20
-        reasons.append(f"✨ Price barely moved +{recent_move}% — VERY EARLY entry")
+        positive += 10; reasons.append(f"✨ Price barely moved +{recent_move}% — very early")
     elif recent_move <= 15:
-        score += 12
-        reasons.append(f"📈 Price +{recent_move}% — still early")
-    elif recent_move <= 25:
-        score += 5
-        reasons.append(f"🟡 Price +{recent_move}% — catching early part")
+        positive += 5; reasons.append(f"📈 Price +{recent_move}% — still early")
 
-    # OI surge = new money entering
-    if oi_chg and oi_chg >= 20:
-        score += 20
-        reasons.append(f"💰 OI +{oi_chg}% SURGING — institutions entering")
-    elif oi_chg and oi_chg >= 10:
-        score += 14
-        reasons.append(f"💰 OI +{oi_chg}% rising fast")
-    elif oi_chg and oi_chg >= 5:
-        score += 8
-        reasons.append(f"📊 OI +{oi_chg}% increasing")
-    elif oi_chg and oi_chg >= 2:
-        score += 4
-        reasons.append(f"📊 OI +{oi_chg}%")
+    if oi_chg and oi_chg >= 10:
+        positive += 10; reasons.append(f"💰 OI +{oi_chg}% — new positions opening")
+    elif oi_chg and oi_chg >= 3:
+        positive += 5
 
-    # RSI
-    if rsi and rsi <= 50:
-        score += 10
-        reasons.append(f"✨ RSI {rsi} — early, lots of room")
-    elif rsi and rsi <= 65:
-        score += 5
-        reasons.append(f"🟡 RSI {rsi} — building")
+    if rsi and rsi <= 60:
+        positive += 5
     elif rsi and rsi > 80:
-        score -= 10
-        reasons.append(f"🔴 RSI {rsi} — already hot")
+        penalty += 12; reasons.append(f"🔴 RSI {rsi} — overbought")
 
-    # Funding
     if funding and funding < -0.01:
-        score += 8
-        reasons.append(f"🔄 Negative funding {funding}% — short squeeze")
-    elif funding and funding > 0.2:
-        score -= 5
-        reasons.append(f"⚠️ High funding {funding}%")
+        positive += 6; reasons.append("🔄 Negative funding — shorts may get squeezed")
+    elif funding and funding > 0.3:
+        penalty += 8; reasons.append(f"⚠️ Funding {funding}% — overheated")
 
-    # 24h volume size (liquidity check)
     if ticker_vol >= 50e6:
-        score += 5
-        reasons.append(f"💎 24h vol ${ticker_vol/1e6:.0f}M — liquid")
-    elif ticker_vol >= 10e6:
-        score += 3
+        positive += 4
 
-    return min(score, 100), reasons
+    positive = max(min(positive, 100), 0)
+    final = max(positive - penalty, 0)
+    return final, reasons
 
 # ══════════════════════════════════════════════════════════
-# TRADE LEVELS
+# TRADE LEVELS — ATR-based, not flat percentages
 # ══════════════════════════════════════════════════════════
-def calculate_levels(price, recent_move, score):
-    """
-    Entry: current market price (explosion = enter NOW)
-    Stop: 7% below (wider for volatile coins)
-    Targets: based on explosion strength
-    """
-    entry = price  # enter at market price immediately
+def calculate_levels(price, atr, score):
+    entry = price
+    if not atr or atr <= 0:
+        atr = price * 0.02
+
+    stop_dist = atr * 1.5
+    stop_dist = max(stop_dist, price * 0.02)
+    stop_dist = min(stop_dist, price * 0.15)
+    stop = entry - stop_dist
 
     if score >= 80:
-        tp1 = entry * 1.10   # 10%
-        tp2 = entry * 1.20   # 20%
-        tp3 = entry * 1.40   # 40%
-        stop = entry * 0.93  # 7% stop
+        mults = (1.5, 3.0, 5.0)
     elif score >= 65:
-        tp1 = entry * 1.07   # 7%
-        tp2 = entry * 1.15   # 15%
-        tp3 = entry * 1.30   # 30%
-        stop = entry * 0.93
+        mults = (1.2, 2.5, 4.0)
     else:
-        tp1 = entry * 1.05   # 5%
-        tp2 = entry * 1.10   # 10%
-        tp3 = entry * 1.20   # 20%
-        stop = entry * 0.94  # 6% stop
+        mults = (1.0, 2.0, 3.0)
+
+    tp1 = entry + stop_dist * mults[0]
+    tp2 = entry + stop_dist * mults[1]
+    tp3 = entry + stop_dist * mults[2]
 
     rr = round((tp1 - entry) / (entry - stop), 1) if entry > stop else 0
     return entry, tp1, tp2, tp3, stop, rr
@@ -341,112 +464,102 @@ def fmt_vol(v):
 # MASTER SCANNER
 # ══════════════════════════════════════════════════════════
 def run_explosion_scanner():
-    """
-    Scans ALL USDT futures pairs for volume explosions.
-    This is what catches TAC, MANTA, ACT, GWEI before they pump.
-    Runs every 5 minutes.
-    """
-    log.info("Explosion scanner running...")
+    log.info("Scanner running (v7 — direction + structure filtered)...")
     tickers = get_all_tickers()
     if not tickers:
         log.error("Failed to get tickers")
         return []
 
-    signals  = []
-    checked  = 0
+    signals = []
 
     for sym, t in tickers.items():
         price = t["price"]
-        gain  = t["gain"]
-        vol   = t["vol_usdt"]
+        vol = t["vol_usdt"]
 
-        if price <= 0: continue
-        if vol < 10_000: continue        # skip dead coins
-        if is_on_cooldown(sym): continue
-
-        # Get 30m candles
-        klines_30m = get_klines_30m(sym, 40)
-        time.sleep(0.06)
-        if not klines_30m: continue
-
-        # PRIMARY SIGNAL: 30m volume explosion
-        exploding_30m, ratio_30m, avg_vol, curr_vol = detect_volume_explosion_30m(klines_30m)
-
-        # Must have explosion to proceed
-        if not exploding_30m: continue
-
-        # Get 5m candles for confirmation
-        klines_5m = get_klines_5m(sym, 20)
-        time.sleep(0.06)
-
-        exploding_5m, ratio_5m = detect_volume_explosion_5m(klines_5m) if klines_5m else (False, 0)
-
-        # Price action check
-        is_early, recent_move = detect_price_action(klines_30m)
-
-        # Skip if already pumped too much (over 30% in last 2 candles)
-        if not is_early and recent_move > 30:
-            log.info(f"{sym}: explosion detected but already moved {recent_move}%, skipping")
+        if price <= 0 or vol < 10_000:
+            continue
+        if is_on_cooldown(sym):
             continue
 
-        # RSI
-        rsi = calc_rsi_simple(klines_30m) if klines_30m else None
+        klines_30m = get_klines(sym, "30m", 45)
+        time.sleep(0.06)
+        if len(klines_30m) < 25:
+            continue
 
-        # Skip overbought
-        if rsi and rsi > 85: continue
+        exploding, ratio_30m, avg_vol, curr_vol = detect_volume_explosion(klines_30m)
+        if not exploding:
+            continue
 
-        # OI + funding
-        oi_chg  = get_oi(sym)
+        # HARD GATE 1 — direction. This is the fix for "dumps in front of me".
+        buy_ratio = buy_sell_ratio(klines_30m[-1])
+        if buy_ratio < 0.60:
+            log.info(f"{sym}: {ratio_30m}x volume but only {buy_ratio*100:.0f}% buy-side — skipping")
+            continue
+
+        # HARD GATE 2 — don't buy into a bearish structure.
+        struct = market_structure(klines_30m)
+        if struct["trend"] == "bearish":
+            log.info(f"{sym}: volume+direction OK but structure is bearish — skipping")
+            continue
+
+        is_early, recent_move = detect_price_action(klines_30m)
+        if not is_early and recent_move > 30:
+            continue
+
+        rsi = calc_rsi(klines_30m)
+        if rsi and rsi > 85:
+            continue
+
+        # Expensive calls only for symbols that survive the cheap filters above.
+        klines_5m = get_klines(sym, "5m", 20)
+        time.sleep(0.06)
+        ratio_5m = simple_ratio(klines_5m, 10) if klines_5m else 0
+
+        htf = htf_bias(sym)
+        time.sleep(0.06)
+        if htf == "bearish" and struct["trend"] != "bullish":
+            continue
+
+        ob = find_last_bullish_ob(klines_30m)
+        fvg = find_recent_fvg(klines_30m)
+
+        oi_chg = get_oi(sym)
         funding = get_funding(sym)
         time.sleep(0.06)
+        if funding and funding > 0.3:
+            continue
 
-        # Skip very high funding (overheated)
-        if funding and funding > 0.3: continue
+        atr = calc_atr(klines_30m)
 
-        # Score it
-        score, reasons = score_explosion(
-            ratio_30m, ratio_5m, recent_move,
+        score, reasons = score_signal(
+            ratio_30m, buy_ratio, recent_move, struct, htf, ob, fvg,
             oi_chg, funding, vol, rsi
         )
+        if ratio_5m >= 20:
+            score = min(score + 8, 100)
+            reasons.append(f"📈 5m also confirming, {ratio_5m}x")
 
-        # Minimum score 55 — lower threshold since volume explosion
-        # itself is already a very strong signal
-        if score < 55: continue
+        if score < 60:
+            continue
 
-        # Calculate trade levels
-        entry, tp1, tp2, tp3, stop, rr = calculate_levels(price, recent_move, score)
+        entry, tp1, tp2, tp3, stop, rr = calculate_levels(price, atr, score)
 
         signals.append({
-            "sym":        sym.replace("USDT", ""),
-            "full_sym":   sym,
-            "price":      price,
-            "gain":       gain,
-            "vol_24h":    vol,
-            "score":      score,
-            "rsi":        rsi,
-            "ratio_30m":  ratio_30m,
-            "ratio_5m":   ratio_5m,
-            "avg_vol":    avg_vol,
-            "curr_vol":   curr_vol,
-            "recent_move": recent_move,
-            "oi_chg":     oi_chg,
-            "funding":    funding,
-            "reasons":    reasons,
-            "entry":      entry,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "stop": stop, "rr": rr,
+            "sym": sym.replace("USDT", ""), "full_sym": sym, "price": price,
+            "gain": t["gain"], "vol_24h": vol, "score": score, "rsi": rsi,
+            "ratio_30m": ratio_30m, "ratio_5m": ratio_5m, "buy_ratio": buy_ratio,
+            "trend": struct["trend"], "event": struct["event"], "htf": htf,
+            "has_ob": bool(ob), "has_fvg": bool(fvg),
+            "avg_vol": avg_vol, "curr_vol": curr_vol, "recent_move": recent_move,
+            "oi_chg": oi_chg, "funding": funding, "reasons": reasons,
+            "entry": entry, "tp1": tp1, "tp2": tp2, "tp3": tp3, "stop": stop, "rr": rr,
         })
+        log.info(f"SIGNAL: {sym} | {ratio_30m}x | buy={buy_ratio} | struct={struct['trend']} | htf={htf} | score={score}")
 
-        checked += 1
-        log.info(f"SIGNAL: {sym} | ratio={ratio_30m}x | score={score} | move={recent_move}%")
-
-    # Sort by volume ratio (strongest explosion first), cap at 3
-    top = sorted(signals, key=lambda x: x["ratio_30m"], reverse=True)[:3]
-
+    top = sorted(signals, key=lambda x: x["score"], reverse=True)[:3]
     for c in top:
         mark_signaled(c["full_sym"])
-
-    log.info(f"Scanner done. Checked all pairs. Signals: {len(top)}")
+    log.info(f"Scanner done. Signals: {len(top)}")
     return top
 
 # ══════════════════════════════════════════════════════════
@@ -456,53 +569,52 @@ def build_alert(coins, triggered_by="auto"):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     if not coins:
-        if triggered_by == "auto": return None
+        if triggered_by == "auto":
+            return None
         return [
             f"**🔍 SCAN** | 🕐 {now}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"😴 No volume explosions detected right now.\n"
-            f"Watching all pairs. Next scan in 5 mins."
+            f"😴 No qualifying setups right now — volume, buy-pressure and "
+            f"structure all have to line up together.\nNext scan in 5 mins."
         ]
 
-    label = "🚨 VOLUME EXPLOSION ALERT" if triggered_by == "auto" else "🔍 MANUAL SCAN"
-    msgs = [
-        f"**{label}** | 🕐 {now}\n"
-        f"⚡ Caught LIVE — enter NOW before price runs!\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━"
-    ]
+    label = "🚨 SIGNAL" if triggered_by == "auto" else "🔍 MANUAL SCAN"
+    msgs = [f"**{label}** | 🕐 {now}\n━━━━━━━━━━━━━━━━━━━━━━━━"]
 
     for i, c in enumerate(coins, 1):
-        rsi = c.get("rsi")
-        rsi_str = f"RSI {rsi}" if rsi else "RSI N/A"
-
-        tp1_pct = round((c["tp1"]-c["entry"])/c["entry"]*100, 1)
-        tp2_pct = round((c["tp2"]-c["entry"])/c["entry"]*100, 1)
-        tp3_pct = round((c["tp3"]-c["entry"])/c["entry"]*100, 1)
-
-        oi_str   = f"OI {'+' if c['oi_chg'] and c['oi_chg']>=0 else ''}{c['oi_chg']}%" if c.get("oi_chg") is not None else ""
+        rsi_str  = f"RSI {c['rsi']}" if c.get("rsi") else "RSI N/A"
+        oi_str   = f"OI {'+' if c['oi_chg'] and c['oi_chg'] >= 0 else ''}{c['oi_chg']}%" if c.get("oi_chg") is not None else ""
         fund_str = f"Fund {c['funding']}%" if c.get("funding") is not None else ""
         sm_line  = " | ".join(filter(None, [rsi_str, oi_str, fund_str]))
 
-        reasons_str = "\n".join(c["reasons"][:5])
+        struct_line = f"Structure: {c['trend'].upper()}" + (f" ({c['event']})" if c.get("event") else "")
+        htf_line = f"1h bias: {c['htf'].upper()}"
+        conf_line = f"OB: {'yes' if c['has_ob'] else 'no'} | FVG: {'yes' if c['has_fvg'] else 'no'} | {int(c['buy_ratio']*100)}% buy volume"
+
+        reasons_str = "\n".join(c["reasons"][:6])
+
+        tp1_pct = round((c["tp1"] - c["entry"]) / c["entry"] * 100, 1)
+        tp2_pct = round((c["tp2"] - c["entry"]) / c["entry"] * 100, 1)
+        tp3_pct = round((c["tp3"] - c["entry"]) / c["entry"] * 100, 1)
 
         msg = (
-            f"\n🚨 **{i}. {c['sym']}/USDT** — VOLUME EXPLOSION\n"
-            f"Score: **{c['score']}/100** | 24h: {'+' if c['gain']>=0 else ''}{c['gain']:.1f}%\n"
+            f"\n🚨 **{i}. {c['sym']}/USDT** — Score {c['score']}/100\n"
+            f"{struct_line} | {htf_line}\n"
+            f"{conf_line}\n"
             f"{sm_line}\n"
             f"\n{reasons_str}\n"
-            f"\n📊 Avg candle vol: `{fmt_vol(c['avg_vol'])}`\n"
-            f"💥 Current candle: `{fmt_vol(c['curr_vol'])}` **({c['ratio_30m']}x above avg)**\n"
+            f"\n📊 Avg candle vol: `{fmt_vol(c['avg_vol'])}` → Current: `{fmt_vol(c['curr_vol'])}` ({c['ratio_30m']}x)\n"
             f"\n💰 Price:  `{fmt_price(c['price'])}`\n"
-            f"🔵 Entry:  `{fmt_price(c['entry'])}` ← **ENTER NOW**\n"
-            f"🎯 TP1:   `{fmt_price(c['tp1'])}` (+{tp1_pct}%) — exit 50%\n"
-            f"🚀 TP2:   `{fmt_price(c['tp2'])}` (+{tp2_pct}%) — exit 35%\n"
-            f"💎 TP3:   `{fmt_price(c['tp3'])}` (+{tp3_pct}%) — exit 15%\n"
+            f"🔵 Entry:  `{fmt_price(c['entry'])}`\n"
+            f"🎯 TP1:   `{fmt_price(c['tp1'])}` (+{tp1_pct}%)\n"
+            f"🚀 TP2:   `{fmt_price(c['tp2'])}` (+{tp2_pct}%)\n"
+            f"💎 TP3:   `{fmt_price(c['tp3'])}` (+{tp3_pct}%)\n"
             f"⛔ Stop:  `{fmt_price(c['stop'])}` | ⚖️ R/R 1:{c['rr']}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         msgs.append(msg)
 
-    msgs.append("⚡ *Volume explosions move fast — act quickly or skip.*\n⚠️ *Not financial advice. Always use stop loss.*")
+    msgs.append("⚠️ Alerts only — this bot does not place trades. Not financial advice, always use a stop loss.")
     return msgs
 
 # ══════════════════════════════════════════════════════════
@@ -513,44 +625,58 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def send_messages(target, msgs):
-    if not msgs: return
+    if not msgs:
+        return
     for msg in msgs:
-        chunks = [msg[i:i+1900] for i in range(0, len(msg), 1900)]
+        chunks = [msg[i:i + 1900] for i in range(0, len(msg), 1900)]
         for chunk in chunks:
             await target.send(chunk)
             await asyncio.sleep(0.3)
 
 @bot.command(name="scan")
 async def scan(ctx):
-    await ctx.send("🔍 **Scanning all pairs for volume explosions...** ~60 secs...")
-    coins = run_explosion_scanner()
-    msgs  = build_alert(coins, "manual")
-    await send_messages(ctx, msgs)
+    await ctx.send("🔍 **Scanning all pairs...** ~60 secs...")
+    try:
+        coins = run_explosion_scanner()
+        msgs = build_alert(coins, "manual")
+        await send_messages(ctx, msgs)
+    except Exception as e:
+        log.error(f"scan command error: {e}")
+        await ctx.send(f"⚠️ Scan hit an error and stopped early: {e}")
 
 @bot.command(name="momentum")
 async def momentum(ctx):
     await ctx.send("⚡ **Scanning for explosions...** ~60 secs...")
-    coins = run_explosion_scanner()
-    msgs  = build_alert(coins, "manual")
-    await send_messages(ctx, msgs)
+    try:
+        coins = run_explosion_scanner()
+        msgs = build_alert(coins, "manual")
+        await send_messages(ctx, msgs)
+    except Exception as e:
+        log.error(f"momentum command error: {e}")
+        await ctx.send(f"⚠️ Scan hit an error and stopped early: {e}")
 
 @bot.command(name="early")
 async def early(ctx):
     await ctx.send("🌅 **Scanning for early explosions...** ~60 secs...")
-    coins = run_explosion_scanner()
-    msgs  = build_alert(coins, "manual")
-    await send_messages(ctx, msgs)
+    try:
+        coins = run_explosion_scanner()
+        msgs = build_alert(coins, "manual")
+        await send_messages(ctx, msgs)
+    except Exception as e:
+        log.error(f"early command error: {e}")
+        await ctx.send(f"⚠️ Scan hit an error and stopped early: {e}")
 
 @bot.command(name="status")
 async def status(ctx):
-    active = [s for s, t in signal_cooldowns.items()
-              if datetime.utcnow() - t < timedelta(hours=4)]
+    active = [s for s, tm in signal_cooldowns.items()
+              if datetime.utcnow() - tm < timedelta(hours=4)]
     await ctx.send(
-        f"**📊 AKA Screener v6.0 — Status**\n"
+        f"**📊 AKA Screener v7.0 — Status**\n"
         f"✅ Online | Scanning every **5 minutes**\n"
         f"👁 Watching ALL USDT futures pairs\n"
         f"🔒 {len(active)} coins on cooldown (4h)\n"
-        f"🎯 Trigger: 30m volume 30x+ above average\n\n"
+        f"🎯 Filters: 30m vol 30x+ AND 60%+ buy-side AND bullish/ranging structure\n"
+        f"⚠️ Alerts only — no live trade execution yet\n\n"
         f"Commands: `!scan` `!status`"
     )
 
@@ -559,37 +685,50 @@ async def status(ctx):
 # ══════════════════════════════════════════════════════════
 async def auto_scan_loop():
     await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
+
+    channel = None
+    for attempt in range(10):
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel:
+            break
+        try:
+            channel = await bot.fetch_channel(CHANNEL_ID)
+            break
+        except Exception as e:
+            log.warning(f"Channel fetch attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(5)
+
     if not channel:
-        log.error("Channel not found!")
+        log.error("Channel not found after retries. Bot stays online for "
+                   "commands, but auto-scan alerts will not post. Check "
+                   "CHANNEL_ID.")
         return
 
     log.info("First scan in 2 minutes...")
-    await asyncio.sleep(120)  # 2 min warmup
+    await asyncio.sleep(120)
 
     while True:
         try:
-            log.info("Auto explosion scan starting...")
+            log.info("Auto scan starting...")
             coins = run_explosion_scanner()
             if coins:
                 msgs = build_alert(coins, "auto")
                 if msgs:
                     await send_messages(channel, msgs)
-                    log.info(f"Sent {len(coins)} explosion alert(s)")
+                    log.info(f"Sent {len(coins)} alert(s)")
             else:
-                log.info("No explosions this round — silent")
+                log.info("No qualifying setups this round — silent")
         except Exception as e:
             log.error(f"Auto scan error: {e}")
 
-        # Wait 5 minutes before next scan
         await asyncio.sleep(5 * 60)
 
 @bot.event
 async def on_ready():
-    print(f"✅ AKA SMC Screener v6.0 online as {bot.user}!")
+    print(f"✅ AKA SMC Screener v7.0 online as {bot.user}!")
     print(f"👁  Watching ALL USDT futures pairs")
-    print(f"⚡ Scanning every 5 minutes for volume explosions")
-    print(f"🎯 Trigger: 30m candle 30x+ above average volume")
+    print(f"⚡ Scanning every 5 minutes")
+    print(f"🎯 Trigger: 30m volume 30x+ AND 60%+ buy-side AND structure filter")
     print(f"⏰ First scan in 2 minutes...")
     bot.loop.create_task(auto_scan_loop())
 
