@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════╗
 ║     AKA SMART MONEY CRYPTO SCREENER BOT v7.0             ║
@@ -732,7 +733,35 @@ async def on_ready():
     print(f"⏰ First scan in 2 minutes...")
     bot.loop.create_task(auto_scan_loop())
 
+# ══════════════════════════════════════════════════════════
+# KEEP-ALIVE WEB SERVER — only needed on Render's FREE tier.
+# Render's free Web Service sleeps after 15 min with no incoming HTTP
+# traffic. A Discord bot never gets HTTP traffic on its own, so this
+# tiny server gives it something to answer — pair it with an external
+# pinger (e.g. UptimeRobot, free) hitting this URL every ~10 minutes.
+# Not needed at all on a paid Background Worker.
+# ══════════════════════════════════════════════════════════
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class _PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"AKA Smart Money Screener v7 - alive")
+
+    def log_message(self, format, *args):
+        pass  # keep Render's logs from filling up with ping requests
+
+def start_keepalive_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _PingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info(f"Keep-alive server listening on port {port}")
+
 if not TOKEN:
     print("ERROR: No DISCORD_TOKEN set!")
 else:
+    start_keepalive_server()
     bot.run(TOKEN)
