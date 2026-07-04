@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════╗
 ║     AKA SMART MONEY CRYPTO SCREENER BOT v7.0             ║
@@ -738,27 +737,45 @@ async def on_ready():
 # Render's free Web Service sleeps after 15 min with no incoming HTTP
 # traffic. A Discord bot never gets HTTP traffic on its own, so this
 # tiny server gives it something to answer — pair it with an external
-# pinger (e.g. UptimeRobot, free) hitting this URL every ~10 minutes.
+# pinger (e.g. UptimeRobot, free) hitting this URL every ~5-10 minutes.
 # Not needed at all on a paid Background Worker.
+#
+# HARDENED VERSION: uses ThreadingHTTPServer (handles each request on
+# its own thread, so one slow/dropped connection can't block the rest)
+# and wraps everything in a watchdog loop — if the server ever dies
+# for any reason, it's recreated automatically instead of silently
+# going dark while the Discord bot keeps running underneath it
+# (which is what made this look "up" internally but "down" externally).
 # ══════════════════════════════════════════════════════════
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class _PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"AKA Smart Money Screener v7 - alive")
+        try:
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"AKA Smart Money Screener v7 - alive")
+        except Exception:
+            pass  # a client disconnecting mid-response must never crash the server
 
     def log_message(self, format, *args):
         pass  # keep Render's logs from filling up with ping requests
 
-def start_keepalive_server():
+def _keepalive_watchdog():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), _PingHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info(f"Keep-alive server listening on port {port}")
+    while True:
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", port), _PingHandler)
+            log.info(f"Keep-alive server listening on port {port}")
+            server.serve_forever()
+        except Exception as e:
+            log.error(f"Keep-alive server crashed, restarting in 2s: {e}")
+            time.sleep(2)
+
+def start_keepalive_server():
+    threading.Thread(target=_keepalive_watchdog, daemon=True).start()
 
 if not TOKEN:
     print("ERROR: No DISCORD_TOKEN set!")
