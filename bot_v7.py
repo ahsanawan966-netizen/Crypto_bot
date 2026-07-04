@@ -73,9 +73,23 @@ def mark_signaled(symbol):
 # ══════════════════════════════════════════════════════════
 # SAFE HTTP — guards against malformed / error JSON payloads
 # ══════════════════════════════════════════════════════════
+# Module-level cooldown: once Binance signals a rate-limit ban (418/429),
+# every request goes quiet until this timestamp passes, instead of
+# retrying every 5 minutes into an active ban and extending it.
+_RATE_LIMIT_UNTIL = {"ts": 0}
+
 def safe_get_json(url, params=None, timeout=15):
+    if time.time() < _RATE_LIMIT_UNTIL["ts"]:
+        return None
     try:
         r = requests.get(url, params=params, timeout=timeout, verify=certifi.where())
+        if r.status_code in (418, 429):
+            retry_after = r.headers.get("Retry-After")
+            wait_s = int(retry_after) if retry_after and retry_after.isdigit() else 180
+            _RATE_LIMIT_UNTIL["ts"] = time.time() + wait_s
+            log.error(f"Binance rate-limited us (HTTP {r.status_code}). "
+                      f"Pausing ALL requests for {wait_s}s instead of retrying into it.")
+            return None
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -463,16 +477,29 @@ def fmt_vol(v):
 # ══════════════════════════════════════════════════════════
 # MASTER SCANNER
 # ══════════════════════════════════════════════════════════
+SYMBOL_SCAN_LIMIT = 150  # cap per cycle — cuts request volume ~in half and
+                          # focuses on the more liquid pairs anyway
+
 def run_explosion_scanner():
+    if time.time() < _RATE_LIMIT_UNTIL["ts"]:
+        remaining = int(_RATE_LIMIT_UNTIL["ts"] - time.time())
+        log.warning(f"Skipping scan — Binance rate-limit cooldown active for {remaining}s more")
+        return []
+
     log.info("Scanner running (v7 — direction + structure filtered)...")
     tickers = get_all_tickers()
     if not tickers:
         log.error("Failed to get tickers")
         return []
 
+    # Only check the most liquid pairs each cycle — same reasoning as the
+    # existing $10K floor below, just applied as a hard cap so one scan
+    # can't fire 300+ individual kline requests in a tight burst.
+    top_symbols = sorted(tickers.items(), key=lambda kv: kv[1]["vol_usdt"], reverse=True)[:SYMBOL_SCAN_LIMIT]
+
     signals = []
 
-    for sym, t in tickers.items():
+    for sym, t in top_symbols:
         price = t["price"]
         vol = t["vol_usdt"]
 
@@ -480,9 +507,12 @@ def run_explosion_scanner():
             continue
         if is_on_cooldown(sym):
             continue
+        if time.time() < _RATE_LIMIT_UNTIL["ts"]:
+            log.warning("Rate-limit cooldown kicked in mid-scan — stopping this cycle early")
+            break
 
         klines_30m = get_klines(sym, "30m", 45)
-        time.sleep(0.06)
+        time.sleep(0.25)
         if len(klines_30m) < 25:
             continue
 
@@ -512,11 +542,11 @@ def run_explosion_scanner():
 
         # Expensive calls only for symbols that survive the cheap filters above.
         klines_5m = get_klines(sym, "5m", 20)
-        time.sleep(0.06)
+        time.sleep(0.15)
         ratio_5m = simple_ratio(klines_5m, 10) if klines_5m else 0
 
         htf = htf_bias(sym)
-        time.sleep(0.06)
+        time.sleep(0.15)
         if htf == "bearish" and struct["trend"] != "bullish":
             continue
 
@@ -525,7 +555,7 @@ def run_explosion_scanner():
 
         oi_chg = get_oi(sym)
         funding = get_funding(sym)
-        time.sleep(0.06)
+        time.sleep(0.15)
         if funding and funding > 0.3:
             continue
 
